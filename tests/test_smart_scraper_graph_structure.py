@@ -9,7 +9,9 @@ These tests use mocked node classes and a captured ``BaseGraph`` so they
 run without any network, LLM, or browser dependencies.
 """
 
+import sys
 from itertools import product
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -300,3 +302,194 @@ def test_node_configs_propagated():
     cond = by_class["_FakeConditionalNode"]
     assert cond.node_name == "ConditionalNode"
     assert cond.node_config["condition"] == 'not answer or answer=="NA"'
+
+
+# ---------------------------------------------------------------------------
+# Hosted ScrapeGraphAI client branch (llm_model="scrapegraphai/smart-scraper")
+#
+# When this sentinel model name is configured, _create_graph skips the local
+# pipeline entirely and delegates to the scrapegraph_py SDK. That SDK import
+# is local to _handle_scrapegraphai_client, so we stub ``scrapegraph_py`` in
+# sys.modules before triggering the branch.
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_scrapegraph_py(response):
+    """
+    Build fake ``scrapegraph_py`` / ``scrapegraph_py.logger`` modules so the
+    local import inside ``_handle_scrapegraphai_client`` succeeds without the
+    real SDK installed.
+
+    Returns the fake ``Client`` class so tests can inspect call arguments.
+    """
+    fake_client = MagicMock(name="ScrapegraphClient")
+    fake_client.return_value.smartscraper.return_value = response
+
+    fake_pkg = ModuleType("scrapegraph_py")
+    fake_pkg.Client = fake_client
+    fake_pkg.__path__ = []  # mark as package for the submodule import
+
+    fake_logger_mod = ModuleType("scrapegraph_py.logger")
+    fake_logger_mod.sgai_logger = MagicMock(name="sgai_logger")
+
+    return fake_pkg, fake_logger_mod, fake_client
+
+
+def _make_sgai_scraper(extra_config=None):
+    """Instantiate SmartScraperGraph with llm_model forced to the sentinel string."""
+    from scrapegraphai.graphs.smart_scraper_graph import SmartScraperGraph
+
+    return SmartScraperGraph(
+        prompt="test prompt",
+        source="https://example.com",
+        config={"llm": {"model": "mock"}, **(extra_config or {})},
+    )
+
+
+@pytest.fixture
+def sgai_scraper():
+    """
+    SmartScraperGraph instance whose llm_model resolves to the sentinel
+    string ``"scrapegraphai/smart-scraper"`` so the client branch is taken.
+
+    Node classes and BaseGraph are patched to harmless fakes so the initial
+    ``__init__`` -> ``_create_graph`` call (which runs *before* we can force
+    the sentinel llm_model) doesn't touch real LLMs or browsers.
+    """
+    patchers = [
+        patch(f"{_SSG_MODULE}.{name}", fake) for name, fake in _NODE_PATCHES.items()
+    ]
+    patchers.append(
+        patch.object(
+            AbstractGraph, "_create_llm", create=True, return_value=MagicMock()
+        )
+    )
+    for p in patchers:
+        p.start()
+    try:
+        ssg = _make_sgai_scraper({"api_key": "sgai-test-key"})
+        ssg.llm_model = "scrapegraphai/smart-scraper"
+        yield ssg
+    finally:
+        for p in patchers:
+            p.stop()
+
+
+@pytest.mark.unit
+def test_scrapegraphai_client_delegates_and_returns_response(sgai_scraper, caplog):
+    """
+    Sentinel llm_model bypasses the local pipeline and returns the SDK
+    response; the request is made with the right URL, prompt and API key,
+    the logger is configured, and the client is closed.
+    """
+    import logging
+
+    response = {"request_id": "req-abc123", "result": {"answer": "42"}}
+    fake_pkg, fake_logger_mod, fake_client = _make_fake_scrapegraph_py(response)
+
+    with patch.dict(
+        sys.modules,
+        {"scrapegraph_py": fake_pkg, "scrapegraph_py.logger": fake_logger_mod},
+    ):
+        with caplog.at_level(logging.INFO, logger=_SSG_MODULE):
+            result = sgai_scraper._create_graph()
+
+    # The raw SDK response is returned in place of a BaseGraph.
+    assert result is response
+
+    # Client is constructed with the api_key from the config.
+    fake_client.assert_called_once_with(api_key="sgai-test-key")
+    # Request uses the instance's source URL and prompt.
+    fake_client.return_value.smartscraper.assert_called_once_with(
+        website_url="https://example.com",
+        user_prompt="test prompt",
+    )
+    # SDK logger is configured and the client is closed after use.
+    fake_logger_mod.sgai_logger.set_logging.assert_called_once_with(level="INFO")
+    fake_client.return_value.close.assert_called_once()
+
+    # Happy path logs request_id and result at INFO.
+    assert any("req-abc123" in r.message for r in caplog.records)
+
+
+@pytest.mark.unit
+def test_scrapegraphai_client_warns_on_missing_keys(sgai_scraper, caplog):
+    """Responses lacking ``request_id`` / ``result`` trigger a warning, not a crash."""
+    import logging
+
+    response = {"unexpected": "shape"}  # missing both expected keys
+    fake_pkg, fake_logger_mod, _ = _make_fake_scrapegraph_py(response)
+
+    with patch.dict(
+        sys.modules,
+        {"scrapegraph_py": fake_pkg, "scrapegraph_py.logger": fake_logger_mod},
+    ):
+        with caplog.at_level(logging.WARNING, logger=_SSG_MODULE):
+            result = sgai_scraper._create_graph()
+
+    assert result is response
+    assert any(
+        "Missing expected keys" in r.message
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    )
+
+
+@pytest.mark.unit
+def test_scrapegraphai_client_import_error():
+    """
+    A missing ``scrapegraph_py`` SDK surfaces as an ``ImportError`` with a
+    helpful install hint rather than a bare ``ModuleNotFoundError``.
+    """
+    patchers = [
+        patch(f"{_SSG_MODULE}.{name}", fake) for name, fake in _NODE_PATCHES.items()
+    ]
+    patchers.append(
+        patch.object(
+            AbstractGraph, "_create_llm", create=True, return_value=MagicMock()
+        )
+    )
+    for p in patchers:
+        p.start()
+    try:
+        ssg = _make_sgai_scraper()
+        ssg.llm_model = "scrapegraphai/smart-scraper"
+
+        # Ensure no stub leaks in from earlier tests: remove both the root
+        # and its submodule so ``from scrapegraph_py import Client`` fails
+        # at import time (not at attribute lookup).
+        removed = {
+            name: sys.modules.pop(name)
+            for name in ("scrapegraph_py", "scrapegraph_py.logger")
+            if name in sys.modules
+        }
+        try:
+            with pytest.raises(ImportError, match="pip install scrapegraph-py"):
+                ssg._handle_scrapegraphai_client()
+        finally:
+            sys.modules.update(removed)
+    finally:
+        for p in patchers:
+            p.stop()
+
+
+@pytest.mark.unit
+def test_non_sentinel_llm_model_builds_local_pipeline(sgai_scraper):
+    """
+    Any llm_model other than the exact sentinel string falls through to the
+    local pipeline – the client handler must not be touched.
+    """
+    # Something close-but-not-equal to the sentinel.
+    sgai_scraper.llm_model = "scrapegraphai/smart-scraper-v2"
+    sgai_scraper.model_token = 4096
+
+    with patch.object(sgai_scraper, "_handle_scrapegraphai_client") as mock_handler:
+        graph = sgai_scraper._create_graph()
+
+    mock_handler.assert_not_called()
+    assert isinstance(graph, _CapturedGraph)
+    assert [type(n).__name__ for n in graph.nodes] == [
+        "_FakeFetchNode",
+        "_FakeParseNode",
+        "_FakeGenerateAnswerNode",
+    ]

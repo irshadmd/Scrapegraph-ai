@@ -94,36 +94,10 @@ class SmartScraperGraph(AbstractGraph):
         Returns:
             BaseGraph: A graph instance representing the web scraping workflow.
         """
+        # Delegate to the hosted ScrapeGraphAI API instead of building a
+        # local node pipeline when the sentinel model name is configured.
         if self.llm_model == "scrapegraphai/smart-scraper":
-            try:
-                from scrapegraph_py import Client
-                from scrapegraph_py.logger import sgai_logger
-            except ImportError:
-                raise ImportError(
-                    "scrapegraph_py is not installed. Please install it using 'pip install scrapegraph-py'."
-                )
-
-            sgai_logger.set_logging(level="INFO")
-
-            # Initialize the client with explicit API key
-            sgai_client = Client(api_key=self.config.get("api_key"))
-
-            # SmartScraper request
-            response = sgai_client.smartscraper(
-                website_url=self.source,
-                user_prompt=self.prompt,
-            )
-
-            # Use logging instead of print for better production practices
-            if "request_id" in response and "result" in response:
-                logger.info(f"Request ID: {response['request_id']}")
-                logger.info(f"Result: {response['result']}")
-            else:
-                logger.warning("Missing expected keys in response.")
-
-            sgai_client.close()
-
-            return response
+            return self._handle_scrapegraphai_client()
 
         # ---- Read flags (each flag toggles exactly one pipeline stage) ----
         # bool() coercion means any truthy value enables the stage, keeping
@@ -176,6 +150,50 @@ class SmartScraperGraph(AbstractGraph):
             entry_point=fetch_node,
             graph_name=self.__class__.__name__,
         )
+
+    def _handle_scrapegraphai_client(self):
+        """
+        Invoke the hosted ScrapeGraphAI SmartScraper API directly and
+        return its raw response in place of a local :class:`BaseGraph`.
+
+        This path is taken when ``self.llm_model`` is set to the sentinel
+        string ``"scrapegraphai/smart-scraper"``; the request is executed
+        immediately (no graph is built) and the API response dict is
+        returned so the caller can store it on ``self.graph``.
+
+        Raises:
+            ImportError: If the optional ``scrapegraph_py`` dependency is
+                not installed.
+        """
+        try:
+            from scrapegraph_py import Client
+            from scrapegraph_py.logger import sgai_logger
+        except ImportError:
+            raise ImportError(
+                "scrapegraph_py is not installed. Please install it using 'pip install scrapegraph-py'."
+            )
+
+        sgai_logger.set_logging(level="INFO")
+
+        # Initialize the client with explicit API key
+        sgai_client = Client(api_key=self.config.get("api_key"))
+
+        # SmartScraper request
+        response = sgai_client.smartscraper(
+            website_url=self.source,
+            user_prompt=self.prompt,
+        )
+
+        # Use logging instead of print for better production practices
+        if "request_id" in response and "result" in response:
+            logger.info(f"Request ID: {response['request_id']}")
+            logger.info(f"Result: {response['result']}")
+        else:
+            logger.warning("Missing expected keys in response.")
+
+        sgai_client.close()
+
+        return response
 
     # ------------------------------------------------------------------
     # Node builders
