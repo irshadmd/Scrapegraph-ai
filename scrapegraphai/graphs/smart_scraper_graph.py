@@ -3,7 +3,7 @@ SmartScraperGraph Module
 """
 
 import logging
-from typing import Optional, Type
+from typing import List, Optional, Tuple, Type
 
 from pydantic import BaseModel
 
@@ -73,6 +73,24 @@ class SmartScraperGraph(AbstractGraph):
         """
         Creates the graph of nodes representing the workflow for web scraping.
 
+        The graph is assembled as a **linear pipeline** where each optional
+        stage is included or skipped based on an independent boolean flag.
+        This replaces the previous combinatorial lookup table (keyed by
+        ``(html_mode, reasoning, reattempt)``) which required 2^N entries
+        and grew exponentially with every new flag.
+
+        Pipeline stages, in order::
+
+            fetch_node                 (always)
+            └─ parse_node              (unless ``html_mode`` is set)
+               └─ reasoning_node       (only if ``reasoning`` is set)
+                  └─ generate_answer_node   (always)
+                     └─ cond_node + regen_node   (only if ``reattempt`` is set)
+
+        Adding a new optional stage is now a matter of:
+        1. building the node when its flag is truthy, and
+        2. inserting it at the right position in the ``pipeline`` list below.
+
         Returns:
             BaseGraph: A graph instance representing the web scraping workflow.
         """
@@ -107,7 +125,71 @@ class SmartScraperGraph(AbstractGraph):
 
             return response
 
-        fetch_node = FetchNode(
+        # ---- Read flags (each flag toggles exactly one pipeline stage) ----
+        # bool() coercion means any truthy value enables the stage, keeping
+        # the three checks consistent with one another.
+        html_mode = bool(self.config.get("html_mode", False))
+        reasoning = bool(self.config.get("reasoning", False))
+        reattempt = bool(self.config.get("reattempt", False))
+
+        # ---- Build individual stages --------------------------------------
+        fetch_node = self._build_fetch_node()
+        parse_node = self._build_parse_node() if not html_mode else None
+        reasoning_node = self._build_reasoning_node() if reasoning else None
+        generate_answer_node = self._build_generate_answer_node()
+
+        # ---- Compose the linear part of the pipeline ----------------------
+        # Each entry is a node in execution order; ``None`` values (disabled
+        # optional stages) are filtered out. Sequential edges between the
+        # remaining nodes are derived automatically, so adding/removing an
+        # optional linear stage here needs no change elsewhere.
+        pipeline = [
+            fetch_node,
+            parse_node,
+            reasoning_node,
+            generate_answer_node,
+        ]
+        nodes: List = [n for n in pipeline if n is not None]
+        edges: List[Tuple] = list(zip(nodes, nodes[1:]))
+
+        # ---- Optional branching tail: reattempt ---------------------------
+        # This stage is non-linear: a ConditionalNode has two outgoing edges
+        # (true -> regenerate, false -> stop) so it's appended explicitly
+        # instead of being part of the zipped chain above.
+        if reattempt:
+            cond_node = self._build_cond_node()
+            regen_node = self._build_regen_node()
+            nodes.extend((cond_node, regen_node))
+            edges.extend(
+                (
+                    (generate_answer_node, cond_node),
+                    # NB: order matters for ConditionalNode – first edge is
+                    #     the *true* branch, second is the *false* branch.
+                    (cond_node, regen_node),  # true: answer invalid -> retry
+                    (cond_node, None),  # false: answer accepted -> stop
+                )
+            )
+
+        return BaseGraph(
+            nodes=nodes,
+            edges=edges,
+            entry_point=fetch_node,
+            graph_name=self.__class__.__name__,
+        )
+
+    # ------------------------------------------------------------------
+    # Node builders
+    #
+    # Each builder is responsible for a single pipeline stage. Keeping the
+    # node construction separate from the pipeline assembly means adding a
+    # new stage amounts to:
+    #   1. writing one builder method, and
+    #   2. inserting the node at the desired spot in ``_create_graph``.
+    # ------------------------------------------------------------------
+
+    def _build_fetch_node(self) -> FetchNode:
+        """Build the fetch stage (always present)."""
+        return FetchNode(
             input="url | local_dir",
             output=["doc"],
             node_config={
@@ -120,13 +202,21 @@ class SmartScraperGraph(AbstractGraph):
                 "storage_state": self.config.get("storage_state"),
             },
         )
-        parse_node = ParseNode(
+
+    def _build_parse_node(self) -> ParseNode:
+        """Build the parse stage (skipped when ``html_mode`` is set)."""
+        return ParseNode(
             input="doc",
             output=["parsed_doc"],
-            node_config={"llm_model": self.llm_model, "chunk_size": self.model_token},
+            node_config={
+                "llm_model": self.llm_model,
+                "chunk_size": self.model_token,
+            },
         )
 
-        generate_answer_node = GenerateAnswerNode(
+    def _build_reasoning_node(self) -> ReasoningNode:
+        """Build the reasoning stage (enabled by ``reasoning``)."""
+        return ReasoningNode(
             input="user_prompt & (relevant_chunks | parsed_doc | doc)",
             output=["answer"],
             node_config={
@@ -136,159 +226,40 @@ class SmartScraperGraph(AbstractGraph):
             },
         )
 
-        cond_node = None
-        regen_node = None
-        if self.config.get("reattempt") is True:
-            cond_node = ConditionalNode(
-                input="answer",
-                output=["answer"],
-                node_name="ConditionalNode",
-                node_config={
-                    "key_name": "answer",
-                    "condition": 'not answer or answer=="NA"',
-                },
-            )
-            regen_node = GenerateAnswerNode(
-                input="user_prompt & answer",
-                output=["answer"],
-                node_config={
-                    "llm_model": self.llm_model,
-                    "additional_info": REGEN_ADDITIONAL_INFO,
-                    "schema": self.schema,
-                },
-            )
+    def _build_generate_answer_node(self) -> GenerateAnswerNode:
+        """Build the answer-generation stage (always present)."""
+        return GenerateAnswerNode(
+            input="user_prompt & (relevant_chunks | parsed_doc | doc)",
+            output=["answer"],
+            node_config={
+                "llm_model": self.llm_model,
+                "additional_info": self.config.get("additional_info"),
+                "schema": self.schema,
+            },
+        )
 
-        if self.config.get("html_mode") is False:
-            parse_node = ParseNode(
-                input="doc",
-                output=["parsed_doc"],
-                node_config={
-                    "llm_model": self.llm_model,
-                    "chunk_size": self.model_token,
-                },
-            )
+    def _build_cond_node(self) -> ConditionalNode:
+        """Build the conditional check for the reattempt stage."""
+        return ConditionalNode(
+            input="answer",
+            output=["answer"],
+            node_name="ConditionalNode",
+            node_config={
+                "key_name": "answer",
+                "condition": 'not answer or answer=="NA"',
+            },
+        )
 
-        reasoning_node = None
-        if self.config.get("reasoning"):
-            reasoning_node = ReasoningNode(
-                input="user_prompt & (relevant_chunks | parsed_doc | doc)",
-                output=["answer"],
-                node_config={
-                    "llm_model": self.llm_model,
-                    "additional_info": self.config.get("additional_info"),
-                    "schema": self.schema,
-                },
-            )
-
-        # Define the graph variation configurations
-        # (html_mode, reasoning, reattempt)
-        graph_variation_config = {
-            (False, True, False): {
-                "nodes": [fetch_node, parse_node, reasoning_node, generate_answer_node],
-                "edges": [
-                    (fetch_node, parse_node),
-                    (parse_node, reasoning_node),
-                    (reasoning_node, generate_answer_node),
-                ],
+    def _build_regen_node(self) -> GenerateAnswerNode:
+        """Build the retry answer-generation stage (enabled by ``reattempt``)."""
+        return GenerateAnswerNode(
+            input="user_prompt & answer",
+            output=["answer"],
+            node_config={
+                "llm_model": self.llm_model,
+                "additional_info": REGEN_ADDITIONAL_INFO,
+                "schema": self.schema,
             },
-            (True, True, False): {
-                "nodes": [fetch_node, reasoning_node, generate_answer_node],
-                "edges": [
-                    (fetch_node, reasoning_node),
-                    (reasoning_node, generate_answer_node),
-                ],
-            },
-            (True, False, False): {
-                "nodes": [fetch_node, generate_answer_node],
-                "edges": [(fetch_node, generate_answer_node)],
-            },
-            (False, False, False): {
-                "nodes": [fetch_node, parse_node, generate_answer_node],
-                "edges": [(fetch_node, parse_node), (parse_node, generate_answer_node)],
-            },
-            (False, True, True): {
-                "nodes": [
-                    fetch_node,
-                    parse_node,
-                    reasoning_node,
-                    generate_answer_node,
-                    cond_node,
-                    regen_node,
-                ],
-                "edges": [
-                    (fetch_node, parse_node),
-                    (parse_node, reasoning_node),
-                    (reasoning_node, generate_answer_node),
-                    (generate_answer_node, cond_node),
-                    (cond_node, regen_node),
-                    (cond_node, None),
-                ],
-            },
-            (True, True, True): {
-                "nodes": [
-                    fetch_node,
-                    reasoning_node,
-                    generate_answer_node,
-                    cond_node,
-                    regen_node,
-                ],
-                "edges": [
-                    (fetch_node, reasoning_node),
-                    (reasoning_node, generate_answer_node),
-                    (generate_answer_node, cond_node),
-                    (cond_node, regen_node),
-                    (cond_node, None),
-                ],
-            },
-            (True, False, True): {
-                "nodes": [fetch_node, generate_answer_node, cond_node, regen_node],
-                "edges": [
-                    (fetch_node, generate_answer_node),
-                    (generate_answer_node, cond_node),
-                    (cond_node, regen_node),
-                    (cond_node, None),
-                ],
-            },
-            (False, False, True): {
-                "nodes": [
-                    fetch_node,
-                    parse_node,
-                    generate_answer_node,
-                    cond_node,
-                    regen_node,
-                ],
-                "edges": [
-                    (fetch_node, parse_node),
-                    (parse_node, generate_answer_node),
-                    (generate_answer_node, cond_node),
-                    (cond_node, regen_node),
-                    (cond_node, None),
-                ],
-            },
-        }
-
-        # Get the current conditions
-        html_mode = self.config.get("html_mode", False)
-        reasoning = self.config.get("reasoning", False)
-        reattempt = self.config.get("reattempt", False)
-
-        # Retrieve the appropriate graph configuration
-        config = graph_variation_config.get((html_mode, reasoning, reattempt))
-
-        if config:
-            return BaseGraph(
-                nodes=config["nodes"],
-                edges=config["edges"],
-                entry_point=fetch_node,
-                graph_name=self.__class__.__name__,
-            )
-
-        # Default return if no conditions match
-        return BaseGraph(
-            nodes=[fetch_node, parse_node, generate_answer_node],
-            edges=[(fetch_node, parse_node), (parse_node, generate_answer_node)],
-            entry_point=fetch_node,
-            graph_name=self.__class__.__name__,
         )
 
     def run(self) -> str:
