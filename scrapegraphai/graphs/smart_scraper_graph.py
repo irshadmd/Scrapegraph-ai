@@ -77,37 +77,101 @@ class SmartScraperGraph(AbstractGraph):
             BaseGraph: A graph instance representing the web scraping workflow.
         """
         if self.llm_model == "scrapegraphai/smart-scraper":
-            try:
-                from scrapegraph_py import Client
-                from scrapegraph_py.logger import sgai_logger
-            except ImportError:
-                raise ImportError(
-                    "scrapegraph_py is not installed. Please install it using 'pip install scrapegraph-py'."
-                )
+            return self._create_scrapegraphai_client_graph()
 
-            sgai_logger.set_logging(level="INFO")
+        return self._build_graph_from_config()
 
-            # Initialize the client with explicit API key
-            sgai_client = Client(api_key=self.config.get("api_key"))
-
-            # SmartScraper request
-            response = sgai_client.smartscraper(
-                website_url=self.source,
-                user_prompt=self.prompt,
+    def _create_scrapegraphai_client_graph(self):
+        """Handles the scrapegraphai/smart-scraper model case using external API."""
+        try:
+            from scrapegraph_py import Client
+            from scrapegraph_py.logger import sgai_logger
+        except ImportError:
+            raise ImportError(
+                "scrapegraph_py is not installed. Please install it using 'pip install scrapegraph-py'."
             )
 
-            # Use logging instead of print for better production practices
-            if "request_id" in response and "result" in response:
-                logger.info(f"Request ID: {response['request_id']}")
-                logger.info(f"Result: {response['result']}")
-            else:
-                logger.warning("Missing expected keys in response.")
+        sgai_logger.set_logging(level="INFO")
 
-            sgai_client.close()
+        sgai_client = Client(api_key=self.config.get("api_key"))
 
-            return response
+        response = sgai_client.smartscraper(
+            website_url=self.source,
+            user_prompt=self.prompt,
+        )
 
-        fetch_node = FetchNode(
+        if "request_id" in response and "result" in response:
+            logger.info(f"Request ID: {response['request_id']}")
+            logger.info(f"Result: {response['result']}")
+        else:
+            logger.warning("Missing expected keys in response.")
+
+        sgai_client.close()
+
+        return response
+
+    def _build_graph_from_config(self) -> BaseGraph:
+        """
+        Builds the graph by composing nodes based on individual config flags.
+
+        The pipeline follows this structure:
+            fetch -> [parse] -> [reasoning] -> generate_answer -> [reattempt]
+
+        Where optional stages are included based on config flags:
+            - parse: included when html_mode is False
+            - reasoning: included when reasoning is True
+            - reattempt: included when reattempt is True
+        """
+        html_mode = self.config.get("html_mode", False)
+        reasoning = self.config.get("reasoning", False)
+        reattempt = self.config.get("reattempt", False)
+
+        # Build nodes
+        fetch_node = self._create_fetch_node()
+        parse_node = None if html_mode else self._create_parse_node()
+        reasoning_node = self._create_reasoning_node() if reasoning else None
+        generate_answer_node = self._create_generate_answer_node()
+        cond_node, regen_node = (
+            self._create_reattempt_nodes() if reattempt else (None, None)
+        )
+
+        # Compose the pipeline
+        nodes = []
+        edges = []
+
+        nodes.append(fetch_node)
+        prev_node = fetch_node
+
+        if parse_node:
+            nodes.append(parse_node)
+            edges.append((prev_node, parse_node))
+            prev_node = parse_node
+
+        if reasoning_node:
+            nodes.append(reasoning_node)
+            edges.append((prev_node, reasoning_node))
+            prev_node = reasoning_node
+
+        nodes.append(generate_answer_node)
+        edges.append((prev_node, generate_answer_node))
+        prev_node = generate_answer_node
+
+        if cond_node and regen_node:
+            nodes.extend([cond_node, regen_node])
+            edges.append((prev_node, cond_node))
+            edges.append((cond_node, regen_node))  # true branch
+            edges.append((cond_node, None))  # false branch (end)
+
+        return BaseGraph(
+            nodes=nodes,
+            edges=edges,
+            entry_point=fetch_node,
+            graph_name=self.__class__.__name__,
+        )
+
+    def _create_fetch_node(self) -> FetchNode:
+        """Creates the FetchNode for retrieving content."""
+        return FetchNode(
             input="url | local_dir",
             output=["doc"],
             node_config={
@@ -120,13 +184,21 @@ class SmartScraperGraph(AbstractGraph):
                 "storage_state": self.config.get("storage_state"),
             },
         )
-        parse_node = ParseNode(
+
+    def _create_parse_node(self) -> ParseNode:
+        """Creates the ParseNode for parsing fetched content."""
+        return ParseNode(
             input="doc",
             output=["parsed_doc"],
-            node_config={"llm_model": self.llm_model, "chunk_size": self.model_token},
+            node_config={
+                "llm_model": self.llm_model,
+                "chunk_size": self.model_token,
+            },
         )
 
-        generate_answer_node = GenerateAnswerNode(
+    def _create_reasoning_node(self) -> ReasoningNode:
+        """Creates the ReasoningNode for additional reasoning before answer generation."""
+        return ReasoningNode(
             input="user_prompt & (relevant_chunks | parsed_doc | doc)",
             output=["answer"],
             node_config={
@@ -136,160 +208,39 @@ class SmartScraperGraph(AbstractGraph):
             },
         )
 
-        cond_node = None
-        regen_node = None
-        if self.config.get("reattempt") is True:
-            cond_node = ConditionalNode(
-                input="answer",
-                output=["answer"],
-                node_name="ConditionalNode",
-                node_config={
-                    "key_name": "answer",
-                    "condition": 'not answer or answer=="NA"',
-                },
-            )
-            regen_node = GenerateAnswerNode(
-                input="user_prompt & answer",
-                output=["answer"],
-                node_config={
-                    "llm_model": self.llm_model,
-                    "additional_info": REGEN_ADDITIONAL_INFO,
-                    "schema": self.schema,
-                },
-            )
-
-        if self.config.get("html_mode") is False:
-            parse_node = ParseNode(
-                input="doc",
-                output=["parsed_doc"],
-                node_config={
-                    "llm_model": self.llm_model,
-                    "chunk_size": self.model_token,
-                },
-            )
-
-        reasoning_node = None
-        if self.config.get("reasoning"):
-            reasoning_node = ReasoningNode(
-                input="user_prompt & (relevant_chunks | parsed_doc | doc)",
-                output=["answer"],
-                node_config={
-                    "llm_model": self.llm_model,
-                    "additional_info": self.config.get("additional_info"),
-                    "schema": self.schema,
-                },
-            )
-
-        # Define the graph variation configurations
-        # (html_mode, reasoning, reattempt)
-        graph_variation_config = {
-            (False, True, False): {
-                "nodes": [fetch_node, parse_node, reasoning_node, generate_answer_node],
-                "edges": [
-                    (fetch_node, parse_node),
-                    (parse_node, reasoning_node),
-                    (reasoning_node, generate_answer_node),
-                ],
+    def _create_generate_answer_node(self) -> GenerateAnswerNode:
+        """Creates the GenerateAnswerNode for generating the final answer."""
+        return GenerateAnswerNode(
+            input="user_prompt & (relevant_chunks | parsed_doc | doc)",
+            output=["answer"],
+            node_config={
+                "llm_model": self.llm_model,
+                "additional_info": self.config.get("additional_info"),
+                "schema": self.schema,
             },
-            (True, True, False): {
-                "nodes": [fetch_node, reasoning_node, generate_answer_node],
-                "edges": [
-                    (fetch_node, reasoning_node),
-                    (reasoning_node, generate_answer_node),
-                ],
-            },
-            (True, False, False): {
-                "nodes": [fetch_node, generate_answer_node],
-                "edges": [(fetch_node, generate_answer_node)],
-            },
-            (False, False, False): {
-                "nodes": [fetch_node, parse_node, generate_answer_node],
-                "edges": [(fetch_node, parse_node), (parse_node, generate_answer_node)],
-            },
-            (False, True, True): {
-                "nodes": [
-                    fetch_node,
-                    parse_node,
-                    reasoning_node,
-                    generate_answer_node,
-                    cond_node,
-                    regen_node,
-                ],
-                "edges": [
-                    (fetch_node, parse_node),
-                    (parse_node, reasoning_node),
-                    (reasoning_node, generate_answer_node),
-                    (generate_answer_node, cond_node),
-                    (cond_node, regen_node),
-                    (cond_node, None),
-                ],
-            },
-            (True, True, True): {
-                "nodes": [
-                    fetch_node,
-                    reasoning_node,
-                    generate_answer_node,
-                    cond_node,
-                    regen_node,
-                ],
-                "edges": [
-                    (fetch_node, reasoning_node),
-                    (reasoning_node, generate_answer_node),
-                    (generate_answer_node, cond_node),
-                    (cond_node, regen_node),
-                    (cond_node, None),
-                ],
-            },
-            (True, False, True): {
-                "nodes": [fetch_node, generate_answer_node, cond_node, regen_node],
-                "edges": [
-                    (fetch_node, generate_answer_node),
-                    (generate_answer_node, cond_node),
-                    (cond_node, regen_node),
-                    (cond_node, None),
-                ],
-            },
-            (False, False, True): {
-                "nodes": [
-                    fetch_node,
-                    parse_node,
-                    generate_answer_node,
-                    cond_node,
-                    regen_node,
-                ],
-                "edges": [
-                    (fetch_node, parse_node),
-                    (parse_node, generate_answer_node),
-                    (generate_answer_node, cond_node),
-                    (cond_node, regen_node),
-                    (cond_node, None),
-                ],
-            },
-        }
-
-        # Get the current conditions
-        html_mode = self.config.get("html_mode", False)
-        reasoning = self.config.get("reasoning", False)
-        reattempt = self.config.get("reattempt", False)
-
-        # Retrieve the appropriate graph configuration
-        config = graph_variation_config.get((html_mode, reasoning, reattempt))
-
-        if config:
-            return BaseGraph(
-                nodes=config["nodes"],
-                edges=config["edges"],
-                entry_point=fetch_node,
-                graph_name=self.__class__.__name__,
-            )
-
-        # Default return if no conditions match
-        return BaseGraph(
-            nodes=[fetch_node, parse_node, generate_answer_node],
-            edges=[(fetch_node, parse_node), (parse_node, generate_answer_node)],
-            entry_point=fetch_node,
-            graph_name=self.__class__.__name__,
         )
+
+    def _create_reattempt_nodes(self) -> tuple:
+        """Creates the ConditionalNode and regeneration node for reattempt logic."""
+        cond_node = ConditionalNode(
+            input="answer",
+            output=["answer"],
+            node_name="ConditionalNode",
+            node_config={
+                "key_name": "answer",
+                "condition": 'not answer or answer=="NA"',
+            },
+        )
+        regen_node = GenerateAnswerNode(
+            input="user_prompt & answer",
+            output=["answer"],
+            node_config={
+                "llm_model": self.llm_model,
+                "additional_info": REGEN_ADDITIONAL_INFO,
+                "schema": self.schema,
+            },
+        )
+        return cond_node, regen_node
 
     def run(self) -> str:
         """
