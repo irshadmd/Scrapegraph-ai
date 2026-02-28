@@ -3,7 +3,7 @@ SmartScraperGraph Module
 """
 
 import logging
-from typing import Optional, Type
+from typing import List, Optional, Tuple, Type
 
 from pydantic import BaseModel
 
@@ -73,22 +73,107 @@ class SmartScraperGraph(AbstractGraph):
         """
         Creates the graph of nodes representing the workflow for web scraping.
 
+        The graph is assembled as a **linear pipeline** where each optional
+        stage is included or skipped based on an independent boolean flag.
+        This replaces the previous combinatorial lookup table (keyed by
+        ``(html_mode, reasoning, reattempt)``) which required 2^N entries
+        and grew exponentially with every new flag.
+
+        Pipeline stages, in order::
+
+            fetch_node                 (always)
+            └─ parse_node              (unless ``html_mode`` is set)
+               └─ reasoning_node       (only if ``reasoning`` is set)
+                  └─ generate_answer_node   (always)
+                     └─ cond_node + regen_node   (only if ``reattempt`` is set)
+
+        Adding a new optional stage is now a matter of:
+        1. building the node when its flag is truthy, and
+        2. inserting it at the right position in the ``pipeline`` list below.
+
         Returns:
             BaseGraph: A graph instance representing the web scraping workflow.
         """
+        # Handle the hosted ScrapeGraphAI API client separately
         if self.llm_model == "scrapegraphai/smart-scraper":
-            return self._create_scrapegraphai_client_graph()
+            return self._handle_scrapegraphai_client()
 
-        return self._build_graph_from_config()
+        # ---- Read flags (each flag toggles exactly one pipeline stage) ----
+        # bool() coercion means any truthy value enables the stage, keeping
+        # the three checks consistent with one another.
+        html_mode = bool(self.config.get("html_mode", False))
+        reasoning = bool(self.config.get("reasoning", False))
+        reattempt = bool(self.config.get("reattempt", False))
 
-    def _create_scrapegraphai_client_graph(self):
-        """Handles the scrapegraphai/smart-scraper model case using external API."""
+        # ---- Build individual stages --------------------------------------
+        fetch_node = self._build_fetch_node()
+        parse_node = self._build_parse_node() if not html_mode else None
+        reasoning_node = self._build_reasoning_node() if reasoning else None
+        generate_answer_node = self._build_generate_answer_node()
+
+        # ---- Compose the linear part of the pipeline ----------------------
+        # Each entry is a node in execution order; ``None`` values (disabled
+        # optional stages) are filtered out. Sequential edges between the
+        # remaining nodes are derived automatically, so adding/removing an
+        # optional linear stage here needs no change elsewhere.
+        pipeline = [
+            fetch_node,
+            parse_node,
+            reasoning_node,
+            generate_answer_node,
+        ]
+        nodes: List = [n for n in pipeline if n is not None]
+        edges: List[Tuple] = list(zip(nodes, nodes[1:]))
+
+        # ---- Optional branching tail: reattempt ---------------------------
+        # This stage is non-linear: a ConditionalNode has two outgoing edges
+        # (true -> regenerate, false -> stop) so it's appended explicitly
+        # instead of being part of the zipped chain above.
+        if reattempt:
+            cond_node = self._build_cond_node()
+            regen_node = self._build_regen_node()
+            nodes.extend((cond_node, regen_node))
+            edges.extend(
+                (
+                    (generate_answer_node, cond_node),
+                    # NB: order matters for ConditionalNode – first edge is
+                    #     the *true* branch, second is the *false* branch.
+                    (cond_node, regen_node),  # true: answer invalid -> retry
+                    (cond_node, None),  # false: answer accepted -> stop
+                )
+            )
+
+        return BaseGraph(
+            nodes=nodes,
+            edges=edges,
+            entry_point=fetch_node,
+            graph_name=self.__class__.__name__,
+        )
+
+    # ------------------------------------------------------------------
+    # Hosted API client handler
+    # ------------------------------------------------------------------
+
+    def _handle_scrapegraphai_client(self):
+        """
+        Handle scraping via the hosted ScrapeGraphAI API.
+
+        This is used when ``llm_model`` is set to ``"scrapegraphai/smart-scraper"``,
+        delegating all work to the remote API instead of building a local graph.
+
+        Returns:
+            The API response (not a BaseGraph instance).
+
+        Raises:
+            ImportError: If ``scrapegraph-py`` is not installed.
+        """
         try:
             from scrapegraph_py import Client
             from scrapegraph_py.logger import sgai_logger
         except ImportError:
             raise ImportError(
-                "scrapegraph_py is not installed. Please install it using 'pip install scrapegraph-py'."
+                "scrapegraph_py is not installed. "
+                "Please install it using 'pip install scrapegraph-py'."
             )
 
         sgai_logger.set_logging(level="INFO")
@@ -110,67 +195,18 @@ class SmartScraperGraph(AbstractGraph):
 
         return response
 
-    def _build_graph_from_config(self) -> BaseGraph:
-        """
-        Builds the graph by composing nodes based on individual config flags.
+    # ------------------------------------------------------------------
+    # Node builders
+    #
+    # Each builder is responsible for a single pipeline stage. Keeping the
+    # node construction separate from the pipeline assembly means adding a
+    # new stage amounts to:
+    #   1. writing one builder method, and
+    #   2. inserting the node at the desired spot in ``_create_graph``.
+    # ------------------------------------------------------------------
 
-        The pipeline follows this structure:
-            fetch -> [parse] -> [reasoning] -> generate_answer -> [reattempt]
-
-        Where optional stages are included based on config flags:
-            - parse: included when html_mode is False
-            - reasoning: included when reasoning is True
-            - reattempt: included when reattempt is True
-        """
-        html_mode = self.config.get("html_mode", False)
-        reasoning = self.config.get("reasoning", False)
-        reattempt = self.config.get("reattempt", False)
-
-        # Build nodes
-        fetch_node = self._create_fetch_node()
-        parse_node = None if html_mode else self._create_parse_node()
-        reasoning_node = self._create_reasoning_node() if reasoning else None
-        generate_answer_node = self._create_generate_answer_node()
-        cond_node, regen_node = (
-            self._create_reattempt_nodes() if reattempt else (None, None)
-        )
-
-        # Compose the pipeline
-        nodes = []
-        edges = []
-
-        nodes.append(fetch_node)
-        prev_node = fetch_node
-
-        if parse_node:
-            nodes.append(parse_node)
-            edges.append((prev_node, parse_node))
-            prev_node = parse_node
-
-        if reasoning_node:
-            nodes.append(reasoning_node)
-            edges.append((prev_node, reasoning_node))
-            prev_node = reasoning_node
-
-        nodes.append(generate_answer_node)
-        edges.append((prev_node, generate_answer_node))
-        prev_node = generate_answer_node
-
-        if cond_node and regen_node:
-            nodes.extend([cond_node, regen_node])
-            edges.append((prev_node, cond_node))
-            edges.append((cond_node, regen_node))  # true branch
-            edges.append((cond_node, None))  # false branch (end)
-
-        return BaseGraph(
-            nodes=nodes,
-            edges=edges,
-            entry_point=fetch_node,
-            graph_name=self.__class__.__name__,
-        )
-
-    def _create_fetch_node(self) -> FetchNode:
-        """Creates the FetchNode for retrieving content."""
+    def _build_fetch_node(self) -> FetchNode:
+        """Build the fetch stage (always present)."""
         return FetchNode(
             input="url | local_dir",
             output=["doc"],
@@ -185,8 +221,8 @@ class SmartScraperGraph(AbstractGraph):
             },
         )
 
-    def _create_parse_node(self) -> ParseNode:
-        """Creates the ParseNode for parsing fetched content."""
+    def _build_parse_node(self) -> ParseNode:
+        """Build the parse stage (skipped when ``html_mode`` is set)."""
         return ParseNode(
             input="doc",
             output=["parsed_doc"],
@@ -196,8 +232,8 @@ class SmartScraperGraph(AbstractGraph):
             },
         )
 
-    def _create_reasoning_node(self) -> ReasoningNode:
-        """Creates the ReasoningNode for additional reasoning before answer generation."""
+    def _build_reasoning_node(self) -> ReasoningNode:
+        """Build the reasoning stage (enabled by ``reasoning``)."""
         return ReasoningNode(
             input="user_prompt & (relevant_chunks | parsed_doc | doc)",
             output=["answer"],
@@ -208,8 +244,8 @@ class SmartScraperGraph(AbstractGraph):
             },
         )
 
-    def _create_generate_answer_node(self) -> GenerateAnswerNode:
-        """Creates the GenerateAnswerNode for generating the final answer."""
+    def _build_generate_answer_node(self) -> GenerateAnswerNode:
+        """Build the answer-generation stage (always present)."""
         return GenerateAnswerNode(
             input="user_prompt & (relevant_chunks | parsed_doc | doc)",
             output=["answer"],
@@ -220,9 +256,9 @@ class SmartScraperGraph(AbstractGraph):
             },
         )
 
-    def _create_reattempt_nodes(self) -> tuple:
-        """Creates the ConditionalNode and regeneration node for reattempt logic."""
-        cond_node = ConditionalNode(
+    def _build_cond_node(self) -> ConditionalNode:
+        """Build the conditional check for the reattempt stage."""
+        return ConditionalNode(
             input="answer",
             output=["answer"],
             node_name="ConditionalNode",
@@ -231,7 +267,10 @@ class SmartScraperGraph(AbstractGraph):
                 "condition": 'not answer or answer=="NA"',
             },
         )
-        regen_node = GenerateAnswerNode(
+
+    def _build_regen_node(self) -> GenerateAnswerNode:
+        """Build the retry answer-generation stage (enabled by ``reattempt``)."""
+        return GenerateAnswerNode(
             input="user_prompt & answer",
             output=["answer"],
             node_config={
@@ -240,7 +279,6 @@ class SmartScraperGraph(AbstractGraph):
                 "schema": self.schema,
             },
         )
-        return cond_node, regen_node
 
     def run(self) -> str:
         """
