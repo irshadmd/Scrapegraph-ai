@@ -436,41 +436,24 @@ def test_scrapegraphai_client_warns_on_missing_keys(sgai_scraper, caplog):
 
 
 @pytest.mark.unit
-def test_scrapegraphai_client_import_error():
+def test_scrapegraphai_client_import_error(sgai_scraper):
     """
     A missing ``scrapegraph_py`` SDK surfaces as an ``ImportError`` with a
     helpful install hint rather than a bare ``ModuleNotFoundError``.
     """
-    patchers = [
-        patch(f"{_SSG_MODULE}.{name}", fake) for name, fake in _NODE_PATCHES.items()
-    ]
-    patchers.append(
-        patch.object(
-            AbstractGraph, "_create_llm", create=True, return_value=MagicMock()
-        )
-    )
-    for p in patchers:
-        p.start()
+    # Ensure no stub leaks in from earlier tests: remove both the root
+    # and its submodule so ``from scrapegraph_py import Client`` fails
+    # at import time (not at attribute lookup).
+    removed = {
+        name: sys.modules.pop(name)
+        for name in ("scrapegraph_py", "scrapegraph_py.logger")
+        if name in sys.modules
+    }
     try:
-        ssg = _make_sgai_scraper()
-        ssg.llm_model = "scrapegraphai/smart-scraper"
-
-        # Ensure no stub leaks in from earlier tests: remove both the root
-        # and its submodule so ``from scrapegraph_py import Client`` fails
-        # at import time (not at attribute lookup).
-        removed = {
-            name: sys.modules.pop(name)
-            for name in ("scrapegraph_py", "scrapegraph_py.logger")
-            if name in sys.modules
-        }
-        try:
-            with pytest.raises(ImportError, match="pip install scrapegraph-py"):
-                ssg._handle_scrapegraphai_client()
-        finally:
-            sys.modules.update(removed)
+        with pytest.raises(ImportError, match="pip install scrapegraph-py"):
+            sgai_scraper._handle_scrapegraphai_client()
     finally:
-        for p in patchers:
-            p.stop()
+        sys.modules.update(removed)
 
 
 @pytest.mark.unit
